@@ -167,7 +167,7 @@ for (const selection of [
     env: { SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test', SLACK_APPROVER_USER_ID: 'UTEST', SLACK_CHANNEL_ID: 'CTEST' },
     appFactory: () => app, now: () => clock, wait: async ms => { clock += ms; }, log: () => {},
   });
-  await controller.start(); controller.beginCycle(5); t.after(() => controller.stop());
+  await controller.start(); controller.beginCycle(); t.after(() => controller.stop());
   const pending = await runCycle({ ...s, submit: true, approvalGate: controller });
   assert.equal(pending.results[0].status, 'approval-pending'); assert.equal(submissions, 0);
   const reply = { type: 'message', user: 'UTEST', channel: 'CTEST', ts: '1700000001.000001', thread_ts: '1700000000.000001', text: selection.reply };

@@ -112,7 +112,7 @@ test('만료된 버튼은 신청하지 않으며 정상 버튼은 저장 전에 
   assert.equal((await expired.store.selectAction(click.body, click.action, binding)).ignored, true);
   const fixture = fakeAppFactory(), dir = await temporary(t);
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); t.after(() => controller.stop()); controller.beginCycle(5);
+  await controller.start(); t.after(() => controller.stop()); controller.beginCycle();
   await controller.check(campaign, review);
   const current = (await controller.requests.list())[0], currentClick = interaction(current);
   let acked = false;
@@ -179,7 +179,7 @@ test('승인은 재시작 후 유지되고 옵션 일치 확인·동시 처리 �
 test('같은 승인 요청은 재전송하지 않고 Slack 스레드 답장으로 승인한다', async t => {
   const fixture = fakeAppFactory(), dir = await temporary(t);
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); controller.beginCycle(5);
+  await controller.start(); controller.beginCycle();
   const first = await controller.check(campaign, review);
   await controller.check(campaign, review);
   assert.equal(fixture.posts.length, 1); assert.equal(first.status, 'approval-pending');
@@ -193,6 +193,67 @@ test('같은 승인 요청은 재전송하지 않고 Slack 스레드 답장으�
   assert.equal(await controller.complete(approved.requestId, 'submitted'), true);
   assert.match(fixture.posts.at(-1).text, /신청 완료/);
   await controller.stop();
+});
+
+test('새 승인 알림 30건은 신청 상한과 별개로 같은 회차에 간격을 지켜 모두 보내고 재전송하지 않는다', async t => {
+  for (const selectedPlan of [plan, review]) {
+    const fixture = fakeAppFactory(), dir = await temporary(t), sentAt = [];
+    const post = fixture.app.client.chat.postMessage;
+    fixture.app.client.chat.postMessage = async payload => {
+      sentAt.push(fixture.now()); return post(payload);
+    };
+    const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+    await controller.start(); t.after(() => controller.stop()); controller.beginCycle();
+    const store = await new StateStore(dir).load();
+    const campaigns = Array.from({ length: 30 }, (_, index) => ({ ...campaign,
+      id: String(200 + index), url: `https://www.musinsa.com/preuser/events/${200 + index}` }));
+    let submissions = 0;
+    const client = { async scan() { return { complete: true, campaigns }; }, async plan() { return selectedPlan; },
+      async prepare() { throw new Error('승인 전에 신청서를 준비하면 안 됩니다.'); }, async submit() { submissions++; } };
+    const options = { client, store, config: { maxApplicationsPerRun: 1, actionDelayMs: 1 },
+      submit: true, approvalGate: controller };
+    const report = await runCycle(options);
+    assert.equal(report.results.length, 30);
+    assert.equal(fixture.posts.length, 30, '30건 모두 다음 정기 시각을 기다리지 않고 알린다');
+    assert.deepEqual(fixture.posts.map(payload => payload.blocks[0].text.text),
+      campaigns.map(c => `━━ 체험단 #${c.id} ━━`));
+    assert.ok(sentAt.slice(1).every((at, index) => at - sentAt[index] >= 1100), '각 메시지의 전송 간격을 지킨다');
+    assert.equal(submissions, 0);
+    assert.ok((await controller.requests.list()).every(request => request.status === 'pending'));
+    controller.beginCycle();
+    await runCycle(options);
+    assert.equal(fixture.posts.length, 30, '같은 승인 대기 공고를 다음 회차에 다시 보내지 않는다');
+  }
+});
+
+test('승인 대기 알림은 24시간이 지나도 모집 마감까지 유지하고 기존 만료 기록도 재발송 없이 복구한다', async t => {
+  for (const legacyStatus of [null, 'pending', 'expired']) {
+    const fixture = fakeAppFactory(), dir = await temporary(t);
+    await fixture.wait(Date.parse('2026-11-08T08:00:00+09:00') - fixture.now());
+    const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+    await controller.start();
+    const open = { ...campaign, endDate: '2026-11-11' };
+    await controller.check(open, plan);
+    const original = (await controller.requests.list())[0];
+    assert.equal(original.expiresAt, Date.parse('2026-11-11T23:59:59+09:00'));
+    if (legacyStatus) await controller.requests.mutate(original.id, r => {
+      r.expiresAt = r.createdAt + 24 * 60 * 60 * 1000; r.status = legacyStatus;
+    });
+    await controller.stop();
+    await fixture.wait(25 * 60 * 60 * 1000);
+    const restarted = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+    await restarted.start(); t.after(() => restarted.stop()); restarted.beginCycle();
+    const result = await restarted.check(open, plan);
+    assert.equal(result.requestId, original.id);
+    assert.equal(result.status, 'approval-pending');
+    assert.equal(fixture.posts.length, 1, '이미 받은 알림을 다음 날 다시 보내지 않는다');
+    const current = (await restarted.requests.list())[0];
+    assert.equal(current.threadTs, original.threadTs);
+    assert.equal(current.uiRevision, original.uiRevision);
+    const click = interaction(current, 0);
+    assert.equal((await restarted.requests.selectAction(click.body, click.action, binding)).approved, true,
+      '원래 알림 버튼은 계속 승인할 수 있다');
+  }
 });
 
 test('재시작하면 누락된 스레드 답장을 페이지 끝까지 읽어 복구하고 다른 사용자·수정·중복 답장은 승인하지 않는다', async t => {
@@ -244,7 +305,7 @@ test('이전 답장 복구가 실패해도 새 승인 답장은 계속 수신한
 test('사이즈 없는 상품도 옵션 번호로 승인하고 실제 선택 옵션을 그대로 검증한다', async t => {
   const fixture = fakeAppFactory(), dir = await temporary(t);
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); t.after(() => controller.stop()); controller.beginCycle(5);
+  await controller.start(); t.after(() => controller.stop()); controller.beginCycle();
   const choices = [
     { ...choice('옵션1', 1), selectionKind: 'option', steps: ['화이트'] },
     { ...choice('옵션2', 2), selectionKind: 'option', steps: ['블랙'] },
@@ -252,8 +313,8 @@ test('사이즈 없는 상품도 옵션 번호로 승인하고 실제 선택 옵
   await controller.check(campaign, { status: 'needs-size-review', selectionKind: 'option',
     review: { choices, measurements: [] } });
   const buttons = fixture.posts[0].blocks.filter(b => b.type === 'actions').flatMap(b => b.elements);
-  assert.deepEqual(buttons.map(b => b.text.text), ['1. 화이트', '2. 블랙']);
-  assert.doesNotMatch(JSON.stringify(fixture.posts[0]), /거절|승인 옵션1|사이즈 확인/);
+  assert.deepEqual(buttons.map(b => b.text.text), ['1. 화이트', '2. 블랙', '거절']);
+  assert.doesNotMatch(JSON.stringify(fixture.posts[0]), /승인 옵션1|사이즈 확인/);
   await fixture.events.message({ event: message('옵션2'), body: { event_id: 'EvSelect', team_id: 'TTEST' } });
   assert.equal((await controller.decision('123')).size, '옵션2');
   const selected = { status: 'planned', ...choices[1] };
@@ -264,10 +325,41 @@ test('사이즈 없는 상품도 옵션 번호로 승인하고 실제 선택 옵
   assert.match(fixture.posts.at(-1).text, /블랙 신청 완료/);
 });
 
+test('옵션이 없는 상품은 승인·거절 버튼만 보내고, 거절하면 만료 후에도 다시 알리지 않는다', async t => {
+  const fixture = fakeAppFactory(), dir = await temporary(t);
+  const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+  await controller.start(); t.after(() => controller.stop()); controller.beginCycle();
+  const only = { productUniqueId: '100', productName: '향수', optionNo: 7, selectedSize: 'NONE', selectionKind: 'option', steps: ['NONE'] };
+  const other = { ...campaign, id: '124', url: 'https://www.musinsa.com/preuser/events/124' };
+  await controller.check(campaign, { status: 'planned', ...only, choices: [only] });
+  await controller.check(other, { status: 'planned', ...only, choices: [only] });
+  assert.match(fixture.posts[0].blocks[1].text.text, /\n옵션 없음 · 승인하면 신청$/);
+  const buttons = post => post.blocks.filter(b => b.type === 'actions').flatMap(b => b.elements);
+  assert.deepEqual(buttons(fixture.posts[0]).map(b => b.text.text), ['승인', '거절']);
+  const requests = await controller.requests.list();
+  const click = async (id, button, ts) => fixture.events.action({ ack: async () => {}, action: { ...button, action_ts: ts },
+    body: { type: 'block_actions', user: { id: 'UTEST' }, team: { id: 'TTEST' }, channel: { id: 'CTEST' },
+      message: { ts: requests.find(r => r.campaign.id === id).threadTs } } });
+  // 다른 알림의 거절 버튼으로는 이 요청을 거절하지 않는다
+  await click('124', buttons(fixture.posts[0])[1], '1700000002.000001');
+  assert.equal((await controller.requests.list()).find(r => r.campaign.id === '124').status, 'pending');
+  await click('123', buttons(fixture.posts[0])[1], '1700000002.000002');
+  assert.equal((await controller.requests.list()).find(r => r.campaign.id === '123').status, 'rejected');
+  assert.match(fixture.posts.at(-1).text, /거절했습니다/);
+  assert.equal(fixture.updates.at(-1).blocks.some(b => b.type === 'actions'), false);
+  assert.match(fixture.updates.at(-1).blocks[1].text.text, /거절함/);
+  await click('124', buttons(fixture.posts[1])[0], '1700000002.000003');
+  assert.equal((await controller.decision('124')).optionNo, 7);
+  const posted = fixture.posts.length;
+  await fixture.wait(25 * 60 * 60 * 1000);
+  assert.equal((await controller.check(campaign, { status: 'planned', ...only, choices: [only] })).status, 'approval-rejected');
+  assert.equal(fixture.posts.length, posted);
+});
+
 test('승인한 옵션이 바뀌면 새 승인을 요구하고 불확실한 Slack 전송을 반복하지 않는다', async t => {
   const dir = await temporary(t), fixture = fakeAppFactory();
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); controller.beginCycle(5);
+  await controller.start(); controller.beginCycle();
   await controller.check(campaign, plan);
   await fixture.events.message({ event: message('승인'), body: { event_id: 'Ev1', team_id: 'TTEST' } });
   const changed = await controller.check(campaign, { ...plan, optionNo: 999 });
@@ -275,7 +367,7 @@ test('승인한 옵션이 바뀌면 새 승인을 요구하고 불확실한 Slac
   assert.equal((await controller.requests.list()).filter(r => r.status === 'stale').length, 1);
   const unknown = fakeAppFactory({ failPost: true });
   const another = new SlackApprovalController(await temporary(t), { env, ...unknown, log: () => {} });
-  await another.start(); another.beginCycle(5);
+  await another.start(); another.beginCycle();
   await assert.rejects(another.check(campaign, plan), /전송을 확인하지 못/);
   assert.equal((await another.check(campaign, plan)).status, 'approval-delivery-uncertain');
   assert.equal(unknown.posts.length, 1);
@@ -284,7 +376,7 @@ test('승인한 옵션이 바뀌면 새 승인을 요구하고 불확실한 Slac
 test('승인 대기 중에는 신청하지 않고 승인 후 결과 유실 시 재제출하지 않는다', async t => {
   const dir = await temporary(t), fixture = fakeAppFactory();
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); controller.beginCycle(5);
+  await controller.start(); controller.beginCycle();
   const state = await new StateStore(dir).load();
   let prepares = 0, submits = 0;
   const client = { async scan() { return { complete: true, campaigns: [campaign] }; },
@@ -328,22 +420,50 @@ test('알림마다 번호·분류 구분 문구를 넣고 제외한 알림에서
 test('신규 공고가 많아도 이미 승인된 공고를 먼저 처리한다', async t => {
   const dir = await temporary(t), fixture = fakeAppFactory();
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); controller.beginCycle(5);
+  await controller.start(); controller.beginCycle();
   await controller.check(campaign, plan);
   await fixture.events.message({ event: message('승인'), body: { event_id: 'Ev1', team_id: 'TTEST' } });
-  controller.beginCycle(1);
+  controller.beginCycle();
   const store = await new StateStore(dir).load(), checked = [];
   const client = { async scan() { return { complete: true, campaigns: [{ ...campaign, id: '999' }, campaign] }; },
     async plan(c) { checked.push(c.id); return plan; }, async prepare() {}, async submit() { return {}; } };
   await runCycle({ client, store, config: { maxApplicationsPerRun: 1, actionDelayMs: 1 }, submit: true, approvalGate: controller });
-  assert.deepEqual(checked, ['123']); assert.equal(store.get('123').status, 'submitted');
+  assert.deepEqual(checked, ['123', '999']); assert.equal(store.get('123').status, 'submitted');
+  assert.equal(store.get('999').status, 'approval-pending');
+});
+
+test('실제 신청 상한에 도달해도 새 알림은 모두 보내고 남은 승인은 다음 묶음에서 처리한다', async t => {
+  const dir = await temporary(t), fixture = fakeAppFactory();
+  const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+  await controller.start(); t.after(() => controller.stop());
+  const campaigns = Array.from({ length: 9 }, (_, index) => ({ ...campaign, id: String(300 + index) }));
+  for (const c of campaigns.slice(0, 2)) {
+    await controller.check(c, plan);
+    const request = (await controller.requests.list()).find(r => r.campaign.id === c.id);
+    const click = interaction(request, 0);
+    await controller.requests.selectAction(click.body, click.action, binding);
+  }
+  const store = await new StateStore(dir).load(), submitted = [];
+  const client = { async scan() { return { complete: true, campaigns }; }, async plan(c) { return { ...plan, campaignId: c.id }; },
+    async prepare() {}, async submit(p) { submitted.push(p.campaignId); return {}; } };
+  const options = { client, store, config: { maxApplicationsPerRun: 1, actionDelayMs: 1 },
+    submit: true, approvalGate: controller };
+  controller.beginCycle();
+  await runCycle(options);
+  assert.equal(submitted.length, 1);
+  assert.equal(Object.values(store.data.campaigns).filter(r => r.status === 'approval-queued').length, 1);
+  assert.equal(fixture.posts.filter(post => !post.thread_ts).length, 9, '남은 신규 공고 7건도 전부 알린다');
+  controller.beginCycle();
+  await runCycle({ ...options, approvedOnly: true });
+  assert.deepEqual(new Set(submitted), new Set(['300', '301']));
+  assert.equal(fixture.posts.filter(post => !post.thread_ts).length, 9, '승인 처리 중 새 알림을 보내지 않는다');
 });
 
 test('정기 알림 시각 밖에서는 승인한 건만 처리하고 새 공고·변경 옵션 알림은 보내지 않는다', async t => {
   for (const changed of [false, true]) {
     const dir = await temporary(t), fixture = fakeAppFactory();
     const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-    await controller.start(); t.after(() => controller.stop()); controller.beginCycle(5);
+    await controller.start(); t.after(() => controller.stop()); controller.beginCycle();
     await controller.check(campaign, plan);
     await fixture.events.message({ event: message('옵션1'), body: { event_id: 'Ev1', team_id: 'TTEST' } });
     const store = await new StateStore(dir).load(), checked = [];
@@ -363,7 +483,7 @@ test('정기 알림 시각 밖에서는 승인한 건만 처리하고 새 공고
 test('로그인 문제도 같은 스레드에 알리고 미제출 승인은 문제 해결 후 한 번 처리한다', async t => {
   const dir = await temporary(t), fixture = fakeAppFactory();
   const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
-  await controller.start(); controller.beginCycle(5);
+  await controller.start(); controller.beginCycle();
   await controller.check(campaign, plan);
   await fixture.events.message({ event: message('승인'), body: { event_id: 'Ev1', team_id: 'TTEST' } });
   let loggedIn = false, submissions = 0;
@@ -378,4 +498,21 @@ test('로그인 문제도 같은 스레드에 알리고 미제출 승인은 문�
   loggedIn = true;
   await runCycle({ client, store, config, submit: true, approvalGate: controller });
   assert.equal(submissions, 1); assert.equal(store.get('123').status, 'submitted');
+});
+
+test('봇 오류는 같은 내용을 6시간에 한 번만 채널에 알리고 정상 회차 뒤 재개를 한 번 알린다', async t => {
+  const fixture = fakeAppFactory(), dir = await temporary(t);
+  const controller = new SlackApprovalController(dir, { env, ...fixture, log: () => {} });
+  await controller.start(); t.after(() => controller.stop());
+  assert.equal(await controller.resolved(), false);
+  assert.equal(await controller.alert('로그인이 필요합니다. <!channel>'), true);
+  assert.equal(await controller.alert('로그인이 필요합니다. <!channel>'), false);
+  assert.equal(fixture.posts.length, 1);
+  assert.equal(fixture.posts[0].channel, 'CTEST');
+  assert.equal(fixture.posts[0].thread_ts, undefined);
+  assert.match(fixture.posts[0].text, /^⚠️ 체험단 봇 오류\n로그인이 필요합니다\. &lt;!channel&gt;$/);
+  assert.equal(await controller.resolved(), true);
+  assert.equal(await controller.resolved(), false);
+  assert.match(fixture.posts.at(-1).text, /정상 동작을 재개/);
+  assert.equal(await controller.alert('로그인이 필요합니다. <!channel>'), true, '재개 후 같은 오류가 다시 나면 알린다');
 });

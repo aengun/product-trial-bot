@@ -73,7 +73,7 @@ async function main() {
       if (e.code === 'EEXIST') throw new Error('설정 파일이 이미 있습니다. 기존 설정을 보존했습니다.');
       throw e;
     }
-    console.log(`${configPath} 생성 완료. 170cm·65kg / 상의 M·L / 하의 29·30 / 신발 260 설정입니다.`);
+    console.log(`${configPath} 생성 완료. 172cm·65kg / 상의 M·L / 하의 29·30 / 신발 260 설정입니다.`);
     return;
   }
   const directory = resolve(values['data-dir']);
@@ -180,13 +180,29 @@ async function main() {
     }
     console.log(approvalController ? '슬랙에서 승인한 공고만 신청합니다.' : values.submit ? '실제 신청 모드입니다.' : '미리보기 모드입니다. 실제 신청은 하지 않습니다.');
     const executeCycle = async (approvedOnly = false) => {
-      approvalController?.beginCycle(config.maxApplicationsPerRun);
+      approvalController?.beginCycle();
       const report = await runCycle({ client, store, config, submit: values.submit, signal: abort.signal, log,
         notify: approvedOnly ? undefined : createSizeNotifier(approvalController ? { ...config, notifications: { ...config.notifications, slack: false } } : config),
         approvalGate: approvalController, approvedOnly });
       console.log(`확인 ${report.scanned}개 · 예정 ${report.results.filter(r => r.status === 'planned').length}개 · 신청 완료 ${report.results.filter(r => r.status === 'submitted').length}개`);
       if (!report.complete) console.log('maxPages 제한으로 일부 공고만 수집했습니다.');
+      await approvalController?.resolved().catch(() => {});
       return report;
+    };
+    // 항상 켜두는 슬랙 승인 모드: 오류를 슬랙으로 알리고 종료하지 않습니다.
+    const reportError = async error => {
+      let text = error instanceof BotError ? error.message : `작업 중 오류가 발생했습니다: ${error.message}`;
+      if (error instanceof OrcaError && error.code === 'browser_tab_not_found') {
+        try {
+          client.tab = await openBotTab(directory, `${ORIGIN}/preuser/main`, { signal: abort.signal });
+          text = '봇이 쓰던 Orca 탭이 닫혀 새 탭을 열었습니다.';
+        } catch { text = '봇이 쓰던 Orca 탭이 닫혔고 새 탭도 열지 못했습니다. Orca 앱을 확인하세요.'; }
+      } else if (error instanceof OrcaError && error.code === 'browser_host_unavailable') {
+        text = 'Orca 앱이 꺼져 있거나 연결되지 않았습니다. Orca를 켜 두세요.';
+      }
+      console.log(`오류: ${text}`);
+      await approvalController?.alert(`${text}\n봇은 켜진 상태로 다음 확인·승인 때 다시 시도합니다.`)
+        .catch(() => console.log('슬랙으로 오류 알림을 보내지 못했습니다.'));
     };
     if (values.watch && config.schedule) {
       const hours = [];
@@ -200,6 +216,7 @@ async function main() {
           return report.results.some(result => result.status === 'submitted');
         },
         wait: (ms, signal) => approvalController ? approvalController.wait(ms, signal) : delay(ms, undefined, { signal }),
+        ...(approvalController ? { onError: reportError } : {}),
       });
       return;
     }
@@ -212,6 +229,7 @@ async function main() {
     } while (!abort.signal.aborted);
   } catch (error) {
     if (abort.signal.aborted) { console.log('봇을 종료했습니다. 제출 중이던 신청은 기록을 확인하세요.'); return; }
+    await approvalController?.alert(`봇이 종료됐습니다: ${error.message}\n다시 켜야 알림·신청이 동작합니다.`).catch(() => {});
     if (error instanceof OrcaError) {
       if (error.code === 'browser_tab_not_found') throw new Error('봇이 쓰던 Orca 탭이 닫혔습니다. 다시 실행하면 새 탭을 엽니다. 신청 기록을 확인하세요.');
       if (error.code === 'browser_host_unavailable') throw new Error('Orca 앱이 꺼져 있거나 연결되지 않았습니다. Orca를 켠 뒤 다시 실행하세요.');

@@ -224,7 +224,11 @@ export class MusinsaClient {
       const shown = await this.wait(locate, { ...list, require: 'visible' }, '옵션 목록이 열리지 않았습니다.');
       if (shown.count !== 1) throw new BotError('source-changed', '옵션 목록을 하나로 특정하지 못했습니다.', true);
       const rows = await this.run(() => this.tab.evaluate(locate, { ...list, child: 'li', texts: true, require: 'none' }));
-      const indices = (rows.texts ?? []).flatMap((t, index) => normalize(t) === normalize(plan.steps[i]) ? [index] : []);
+      const want = normalize(plan.steps[i]);
+      const matching = text => (rows.texts ?? []).flatMap((t, index) => normalize(t) === text ? [index] : []);
+      let indices = matching(want);
+      // API의 단일 옵션 'NONE'은 신청 화면에 'FREE'로 표시됩니다. 최종 SKU 번호는 아래에서 다시 확인합니다.
+      if (!indices.length && want === 'none') indices = matching('free');
       if (indices.length !== 1) throw new BotError('option-changed', `옵션이 변경됐거나 유일하지 않습니다: ${plan.steps[i]}`);
       await this.click({ ...list, child: 'li', nth: indices[0] }, `옵션 ${plan.steps[i]}`);
       await this.wait(noVisible, selectors.optionList, '옵션 목록이 닫히지 않았습니다.');

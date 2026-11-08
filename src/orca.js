@@ -69,17 +69,17 @@ export class OrcaTab {
     }
   }
   /**
-   * 실제 마우스 클릭과 같은 이벤트를 보냅니다. 탭이 화면에 없을 때 Orca가 사용자 입력을 보호하려고
-   * 클릭을 보내지 않으면("input was not sent") 다시 시도하고, 그래도 안 되면 봇 탭을 앞으로 띄웁니다.
+   * 실제 마우스 클릭과 같은 이벤트를 보냅니다. Orca 창이 0.15초 안에 사용자 입력 보호를 확인하지 못하면
+   * 클릭을 보내지 않으므로("input was not sent") 간격을 늘려 가며 다시 시도하고, 두 번째 실패 후 봇 탭을 띄웁니다.
    * 보내지 않았다고 확인된 경우에만 재시도하므로 두 번 눌리지 않습니다.
    */
-  async click(selector) {
+  async click(selector, { attempts = 6 } = {}) {
     for (let attempt = 0; ; attempt++) {
       try { return await this.call(['click'], ['--element', selector]); }
       catch (error) {
-        if (!/input was not sent/i.test(error.message) || attempt >= 2) throw error;
+        if (!/input was not sent/i.test(error.message) || attempt >= attempts - 1) throw error;
         if (attempt === 1) await this.show().catch(() => {});
-        await delay(this.pollMs * 2, undefined, { signal: this.signal });
+        await delay(this.pollMs * 2 ** (attempt + 1), undefined, { signal: this.signal });
       }
     }
   }

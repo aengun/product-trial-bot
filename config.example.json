@@ -4,7 +4,7 @@
     "전체"
   ],
   "profile": {
-    "heightCm": 170,
+    "heightCm": 172,
     "weightKg": 65,
     "topSizes": [
       "M",
@@ -69,8 +69,8 @@
   "schedule": {
     "timeZone": "Asia/Seoul",
     "startHour": 8,
-    "endHour": 22,
-    "intervalHours": 2
+    "endHour": 8,
+    "intervalHours": 24
   },
   "excludeCategories": [
     "키즈"

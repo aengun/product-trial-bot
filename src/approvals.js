@@ -11,6 +11,8 @@ export function planProof(plan) {
 }
 export const choiceLabel = choice => choice.steps.map(step => normalize(step) === 'none' ? '기본 구성' : step).join(' / ');
 export const buttonValue = (request, choice) => JSON.stringify({ requestId: request.id, revision: request.uiRevision, proof: planProof(choice) });
+export const rejectValue = request => JSON.stringify({ requestId: request.id, revision: request.uiRevision, action: 'reject' });
+export const REJECT_ACTION = 'musinsa_reject';
 const fingerprint = (campaign, choices) => hash({ campaignId: campaign.id, choices });
 export function validChoice(plan) {
   return /^\d+$/.test(plan?.productUniqueId ?? '') && Number.isSafeInteger(plan.optionNo) && plan.optionNo > 0
@@ -40,6 +42,10 @@ function matchingChoices(choices, text) {
 function approve(request, choice, userId, now) {
   request.selectedChoice = choice; request.status = 'approved'; request.approvedAt = now; request.approvedBy = userId;
   return { request, approved: true, text: `${choiceLabel(choice)} 신청 접수. 결과를 이 스레드로 알려드립니다.` };
+}
+function reject(request, userId, now) {
+  request.status = 'rejected'; request.rejectedAt = now; request.rejectedBy = userId;
+  return { request, rejected: true, text: '거절했습니다. 이 체험단은 신청하지 않고 다시 알리지 않습니다.' };
 }
 
 async function atomicWrite(path, data) {
@@ -86,13 +92,15 @@ export class ApprovalStore {
   async ensure(campaign, plan, binding) {
     const choices = approvalChoices(plan);
     const proof = fingerprint(campaign, choices, plan.review?.measurements ?? []);
-    const matching = (await this.list()).filter(r => r.campaign.id === campaign.id && (r.fingerprint === proof || r.status === 'rejected')
-      && this.matchesBinding(r, binding) && (r.expiresAt > this.now() || ['processing', 'submitted', 'uncertain'].includes(r.status))
-      && !['stale', 'expired', 'excluded'].includes(r.status)).sort((a, b) => b.createdAt - a.createdAt);
+    // 거절한 공고는 승인 요청 만료 후에도 다시 알리지 않습니다.
+    const matching = (await this.list()).filter(r => r.campaign.id === campaign.id && this.matchesBinding(r, binding)
+      && (r.status === 'rejected' || (r.fingerprint === proof
+        && (r.expiresAt > this.now() || ['processing', 'submitted', 'uncertain'].includes(r.status))
+        && !['stale', 'expired', 'excluded'].includes(r.status)))).sort((a, b) => b.createdAt - a.createdAt);
     if (matching.length) return { request: matching[0], created: false };
     const createdAt = this.now();
     const deadline = Date.parse(`${campaign.endDate ?? ''}T23:59:59+09:00`);
-    const expiresAt = Math.min(createdAt + 24 * 60 * 60 * 1000, Number.isFinite(deadline) ? deadline : Infinity);
+    const expiresAt = Number.isFinite(deadline) ? deadline : createdAt + 24 * 60 * 60 * 1000;
     const request = { version: 1, id: randomUUID(), fingerprint: proof, campaign: {
       id: campaign.id, title: campaign.title, url: campaign.url, endDate: campaign.endDate, category: plan.category ?? campaign.category,
     }, choices, selectedChoice: null, replyMode: 'option-submit', uiRevision: randomUUID(),
@@ -104,6 +112,19 @@ export class ApprovalStore {
   }
   matchesBinding(request, binding) {
     return ['teamId', 'channelId', 'userId'].every(k => request.binding[k] === binding[k]);
+  }
+  /** 기존 24시간 만료 알림도 모집 중이면 원래 메시지에서 계속 승인할 수 있게 합니다. */
+  async keepPendingUntilDeadline(binding) {
+    for (const request of await this.list()) {
+      if (!['pending', 'expired'].includes(request.status) || !this.matchesBinding(request, binding)) continue;
+      const deadline = Date.parse(`${request.campaign.endDate ?? ''}T23:59:59+09:00`);
+      if (!Number.isFinite(deadline) || deadline <= this.now() || deadline <= request.expiresAt) continue;
+      await this.mutate(request.id, r => {
+        if (!['pending', 'expired'].includes(r.status) || !this.matchesBinding(r, binding)) return { save: false };
+        r.expiresAt = deadline; r.status = 'pending';
+        return { request: r };
+      });
+    }
   }
   async posted(id, channel, ts) {
     return this.mutate(id, r => {
@@ -152,9 +173,7 @@ export class ApprovalStore {
       // 이미 승인한 요청은 중복·추가 답장으로 옵션을 바꾸지 않습니다.
       if (r.status === 'approved') return { request: r, text: '이미 승인된 요청입니다. 같은 신청을 다시 실행하지 않습니다.' };
       const text = normalize(message.text);
-      if (['거절', '취소', '건너뛰기'].includes(text)) {
-        r.status = 'rejected'; return { request: r, text: '이 체험단 신청을 건너뜁니다.' };
-      }
+      if (['거절', '취소', '건너뛰기'].includes(text)) return reject(r, message.user, this.now());
       let explicitApproval = text === '승인', size = null;
       const generic = r.selectionKind === 'option' || r.choices.some(choice => choice.selectionKind === 'option');
       const example = r.choices[0]?.choiceKey ?? '옵션1';
@@ -186,14 +205,21 @@ export class ApprovalStore {
     let value;
     try { value = JSON.parse(action.value); } catch { return { ignored: true }; }
     if (!value || typeof value !== 'object' || Array.isArray(value)) return { ignored: true };
+    const rejecting = action.action_id === REJECT_ACTION;
     if (!/^[0-9a-f-]{36}$/.test(value.requestId ?? '') || !/^[0-9a-f-]{36}$/.test(value.revision ?? '')
-      || !/^[0-9a-f]{64}$/.test(value.proof ?? '')) return { ignored: true };
+      || (rejecting ? value.action !== 'reject' : !/^[0-9a-f]{64}$/.test(value.proof ?? ''))) return { ignored: true };
     const threadTs = body.message?.thread_ts ?? body.message?.ts ?? body.container?.message_ts;
     const request = (await this.list()).find(r => r.id === value.requestId && r.threadTs === threadTs
       && this.matchesBinding(r, binding));
     if (!request) return { ignored: true };
     return this.mutate(request.id, r => {
       if (r.status !== 'pending' || r.uiRevision !== value.revision || r.expiresAt <= this.now()) return { ignored: true, save: false };
+      if (rejecting) {
+        const key = `button:${body.user.id}:${action.action_ts}`;
+        if (r.processedEvents.includes(key)) return { ignored: true, save: false };
+        r.processedEvents = [...r.processedEvents, key].slice(-200);
+        return reject(r, body.user.id, this.now());
+      }
       const index = r.choices.findIndex(choice => planProof(choice) === value.proof);
       if (index < 0 || action.action_id !== `musinsa_choose_${index + 1}`) return { ignored: true, save: false };
       const key = `button:${body.user.id}:${action.action_ts}`;

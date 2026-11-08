@@ -35,7 +35,6 @@ export async function runCycle({ client, store, config, submit = false, signal, 
           if (!approval.approved) {
             const result = { ...campaign, ...plan, status: approval.status, reason: approval.reason, approvalRequestId: approval.requestId };
             await store.set(campaign.id, result); report.results.push(result); log(result);
-            if (approvalGate.budgetReached()) break;
             await delay(config.actionDelayMs, undefined, { signal });
             continue;
           }
@@ -62,6 +61,13 @@ export async function runCycle({ client, store, config, submit = false, signal, 
           }
           report.results.push(result); log(result);
           await delay(config.actionDelayMs, undefined, { signal });
+          continue;
+        }
+        // 정기 확인에서는 신청 상한에 도달해도 남은 공고의 승인 알림을 계속 보냅니다.
+        if (approvalGate && planned >= config.maxApplicationsPerRun) {
+          const result = { ...campaign, ...plan, status: 'approval-queued',
+            reason: '승인된 신청은 다음 처리 묶음에서 이어서 진행합니다.', approvalRequestId: approval.requestId };
+          await store.set(campaign.id, result); report.results.push(result); log(result);
           continue;
         }
         planned++;
@@ -100,7 +106,7 @@ export async function runCycle({ client, store, config, submit = false, signal, 
         if (attempted) throw new BotError('uncertain', result.reason, true);
         if (!(error instanceof BotError) || error.fatal) throw error;
       }
-      if (planned >= config.maxApplicationsPerRun) break;
+      if (planned >= config.maxApplicationsPerRun && (!approvalGate || approvedOnly)) break;
       await delay(config.actionDelayMs, undefined, { signal });
     }
     return report;

@@ -16,18 +16,33 @@ export const formatScheduledTime = timestamp => new Intl.DateTimeFormat('ko-KR',
   timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 }).format(timestamp);
 
+/**
+ * onError가 있으면 오류가 나도 종료하지 않습니다. 정기 확인이 실패하면 retryMs 뒤 최대 maxRetries번
+ * 다시 시도하고(다음 정기 시각을 넘기지 않음), 승인 건 처리가 실패하면 다음 승인·정기 시각까지 기다립니다.
+ */
 export async function watchSchedule({ schedule, runScheduled, runApproved = async () => false,
-  wait, signal, now = Date.now, log = () => {} }) {
-  let nextAt = nextScheduledRun(schedule, now());
+  wait, signal, now = Date.now, log = () => {}, onError, retryMs = 10 * 60 * 1000, maxRetries = 3 }) {
+  let nextAt = nextScheduledRun(schedule, now()), retries = 0;
+  const attempt = async run => {
+    try { return { ok: true, value: await run() }; }
+    catch (error) {
+      if (signal?.aborted || !onError) throw error;
+      await onError(error);
+      return { ok: false };
+    }
+  };
   for (;;) {
     signal?.throwIfAborted();
     if (now() >= nextAt) {
-      await runScheduled();
-      nextAt = nextScheduledRun(schedule, now() + 1);
+      const { ok } = await attempt(runScheduled);
+      const regular = nextScheduledRun(schedule, now() + 1);
+      if (!ok && retries < maxRetries) { retries++; nextAt = Math.min(now() + retryMs, regular); }
+      else { retries = 0; nextAt = regular; }
       continue;
     }
     // 버튼 승인으로 깨어나도 신규 공고 알림 시각은 바꾸지 않습니다.
-    if (await runApproved()) continue;
+    const approved = await attempt(runApproved);
+    if (approved.ok && approved.value) continue;
     signal?.throwIfAborted();
     if (now() >= nextAt) continue;
     log(`다음 공고 확인·알림: ${formatScheduledTime(nextAt)} (한국 시간). 옵션 버튼은 계속 접수합니다.`);

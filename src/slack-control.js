@@ -1,8 +1,13 @@
 import bolt from '@slack/bolt';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ApprovalStore, planProof, validChoice, buttonValue, choiceLabel } from './approvals.js';
+import { ApprovalStore, planProof, validChoice, buttonValue, rejectValue, REJECT_ACTION, choiceLabel } from './approvals.js';
 import { campaignLink } from './slack.js';
-import { CATEGORY_NAMES } from './filters.js';
+import { CATEGORY_NAMES, normalize } from './filters.js';
+
+/** 상품명을 뺀 옵션 단계가 API의 NONE(화면 표시 FREE)뿐이면 옵션이 없는 상품입니다. */
+const withoutOption = choice => choice.steps.filter(step => step !== choice.productName)
+  .every(step => ['none', 'free'].includes(normalize(step)));
+const APPROVAL_BATCH_SIZE = 5;
 
 export function slackControlSettings(env = process.env) {
   if (!/^xoxb-[A-Za-z0-9-]+$/.test(env.SLACK_BOT_TOKEN ?? '')) throw new Error('.env의 SLACK_BOT_TOKEN(xoxb-) 설정이 필요합니다.');
@@ -16,17 +21,27 @@ export function slackControlSettings(env = process.env) {
 export function approvalPayload(request) {
   const title = request.campaign.title.replace(/\s*체험단\s*\d+명\s*모집\s*$/, '').trim();
   const active = ['posting', 'pending'].includes(request.status);
+  const single = request.choices.length === 1 ? request.choices[0] : null;
   const statusText = { submitted: '신청 완료', uncertain: '신청 결과 확인 필요', approved: '선택 접수',
-    processing: '신청 중', expired: '모집 마감', stale: '옵션 갱신 필요', rejected: '건너뛴 공고',
+    processing: '신청 중', expired: '모집 마감', stale: '옵션 갱신 필요', rejected: request.rejectedBy ? '거절함' : '건너뛴 공고',
     excluded: `제외 · ${request.excludedReason ?? '필터 설정'}` }[request.status] ?? '확인 필요';
   const categoryName = CATEGORY_NAMES[request.campaign.category] ?? request.campaign.category;
   const category = categoryName !== '전체' && Object.values(CATEGORY_NAMES).includes(categoryName) ? ` · ${categoryName}` : '';
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: `━━ 체험단 #${request.campaign.id}${category} ━━`.slice(0, 150) } },
     { type: 'section', text: { type: 'plain_text', text: active
-      ? `${title}\n옵션 ${request.choices.length}개 · 누르면 신청`
+      ? `${title}\n${single ? `${withoutOption(single) ? '옵션 없음' : choiceLabel(single)} · 승인하면 신청` : `옵션 ${request.choices.length}개 · 누르면 신청`}`
       : `${title}\n${statusText}${request.selectedChoice && request.status !== 'excluded' ? `: ${choiceLabel(request.selectedChoice)}` : ''}` } },
   ];
+  const rejectButton = { type: 'button', action_id: REJECT_ACTION, style: 'danger',
+    text: { type: 'plain_text', text: '거절' }, value: rejectValue(request) };
+  // 고를 옵션이 하나뿐이면 승인·거절 버튼만 보냅니다.
+  if (active && single) {
+    blocks.push({ type: 'actions', block_id: `${request.id}:${request.uiRevision}:0:0`, elements: [
+      { type: 'button', action_id: 'musinsa_choose_1', style: 'primary', text: { type: 'plain_text', text: '승인' },
+        accessibility_label: `${single.choiceKey ?? '옵션1'} ${choiceLabel(single)} 승인`.slice(0, 75), value: buttonValue(request, single) },
+      rejectButton] });
+  }
   const groups = new Map();
   request.choices.forEach((choice, index) => {
     if (!groups.has(choice.productUniqueId)) groups.set(choice.productUniqueId, []);
@@ -34,7 +49,7 @@ export function approvalPayload(request) {
   });
   const rowSize = Math.max(4, Math.ceil(request.choices.length / 40));
   if (rowSize > 25) throw new Error('한 알림에 표시할 수 있는 조합 수를 초과했습니다.');
-  if (active) for (const group of groups.values()) {
+  if (active && !single) for (const group of groups.values()) {
     if (groups.size > 1) blocks.push({ type: 'section', text: { type: 'plain_text', text: group[0].choice.productName.slice(0, 2900) } });
     for (let offset = 0; offset < group.length; offset += rowSize) {
       blocks.push({ type: 'actions', block_id: `${request.id}:${request.uiRevision}:${group[0].index}:${offset}`,
@@ -47,6 +62,7 @@ export function approvalPayload(request) {
         }) });
     }
   }
+  if (active && !single) blocks.push({ type: 'actions', block_id: `${request.id}:${request.uiRevision}:reject`, elements: [rejectButton] });
   blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `<${campaignLink(request.campaign.url)}|공고 보기>`, verbatim: true } },
     { type: 'divider' });
   if (blocks.length > 50) throw new Error('조합 버튼이 Slack 메시지의 블록 수 한도를 초과했습니다.');
@@ -68,13 +84,13 @@ export class SlackApprovalController {
     this.requests = new ApprovalStore(directory, { now });
     this.app = appFactory({ token: this.settings.botToken, appToken: this.settings.appToken, socketMode: true,
       ignoreSelf: true, logger: silentLogger, clientOptions: { retryConfig: { retries: 0 }, rejectRateLimitedCalls: true, timeout: 10000 } });
-    this.dirty = false; this.waiters = new Set(); this.postedThisCycle = 0; this.postLimit = 5; this.nextPostAt = 0;
+    this.dirty = false; this.waiters = new Set(); this.postedThisCycle = 0; this.nextPostAt = 0;
     this.app.event('message', async ({ event, body }) => {
       try {
         await this.handleReply(event, body.event_id, body.team_id);
       } catch { this.log('슬랙 답장을 처리하지 못했습니다. 승인 기록을 확인하세요.'); }
     });
-    this.app.action(/^musinsa_choose_\d+$/, async ({ ack, body, action }) => {
+    this.app.action(/^musinsa_(choose_\d+|reject)$/, async ({ ack, body, action }) => {
       await ack();
       try { await this.acceptResult(await this.requests.selectAction(body, action, this.binding)); }
       catch { this.log('슬랙 옵션 버튼을 처리하지 못했습니다. 선택 기록을 확인하세요.'); }
@@ -86,6 +102,7 @@ export class SlackApprovalController {
       const auth = await this.app.client.auth.test();
       if (!auth.ok || !/^T[A-Z0-9]+$/.test(auth.team_id ?? '')) throw new Error();
       this.binding = { teamId: auth.team_id, channelId: this.settings.channelId, userId: this.settings.userId };
+      await this.requests.keepPendingUntilDeadline(this.binding);
       await this.app.start();
     } catch { throw new Error('슬랙 답장 연결을 시작하지 못했습니다. 토큰, Socket Mode, 이벤트 권한을 확인하세요.'); }
     try {
@@ -100,7 +117,7 @@ export class SlackApprovalController {
   async acceptResult(result) {
     if (result.approved) this.wake();
     if (result.text) await this.postThread(result.request, result.text);
-    if (result.approved) await this.updateRequestMessage(result.request.id).catch(() => this.log('선택 접수는 저장했지만 버튼 표시를 갱신하지 못했습니다.'));
+    if (result.approved || result.rejected) await this.updateRequestMessage(result.request.id).catch(() => this.log('선택 접수는 저장했지만 버튼 표시를 갱신하지 못했습니다.'));
     return result;
   }
   /** Socket Mode가 꺼져 있을 때 놓친 답장을 실제 채널 기록에서 복구합니다. */
@@ -142,8 +159,7 @@ export class SlackApprovalController {
     return recovered;
   }
   async stop() { await this.app.stop(); }
-  beginCycle(limit) { this.postedThisCycle = 0; this.postLimit = limit; }
-  budgetReached() { return this.postedThisCycle >= this.postLimit; }
+  beginCycle() { this.postedThisCycle = 0; }
   wake() { this.dirty = true; for (const wake of this.waiters) wake(); }
   async wait(timeoutMs, signal) {
     if (this.dirty) { this.dirty = false; return; }
@@ -186,9 +202,8 @@ export class SlackApprovalController {
       return { approved: false, status: 'approval-delivery-uncertain', reason: '이전 승인 알림의 전송 결과를 확인할 수 없어 자동 재전송하지 않습니다.' };
     }
     if (created) {
-      if (this.budgetReached()) {
-        await this.requests.mark(request.id, 'stale');
-        return { approved: false, status: 'approval-pending', reason: '다음 회차에 슬랙 승인 요청을 보냅니다.' };
+      if (this.postedThisCycle > 0 && this.postedThisCycle % APPROVAL_BATCH_SIZE === 0) {
+        this.log(`슬랙 승인 알림 ${this.postedThisCycle}건 전송 완료. 다음 ${APPROVAL_BATCH_SIZE}건을 이어서 보냅니다.`);
       }
       this.postedThisCycle++;
       try {
@@ -240,6 +255,28 @@ export class SlackApprovalController {
     });
     this.messageQueue = work.catch(() => {});
     return work;
+  }
+  /** 봇 자체 오류를 채널에 알립니다. 같은 내용은 6시간에 한 번만 보냅니다. */
+  async alert(text) {
+    if (!this.binding) return false;
+    const message = String(text).slice(0, 500);
+    this.alerts ??= new Map();
+    const last = this.alerts.get(message);
+    if (last !== undefined && this.now() - last < 6 * 60 * 60 * 1000) return false;
+    this.alerts.set(message, this.now()); this.alertOpen = true;
+    const result = await this.postMessage({ channel: this.binding.channelId, mrkdwn: false, parse: 'none',
+      unfurl_links: false, unfurl_media: false,
+      text: `⚠️ 체험단 봇 오류\n${message}`.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') });
+    if (!result.ok) throw new Error('슬랙 오류 알림 실패');
+    return true;
+  }
+  /** 오류를 알린 뒤 확인·신청 회차가 정상으로 끝나면 한 번 알립니다. */
+  async resolved() {
+    if (!this.alertOpen || !this.binding) return false;
+    this.alertOpen = false; this.alerts?.clear();
+    const result = await this.postMessage({ channel: this.binding.channelId, mrkdwn: false, parse: 'none',
+      text: '✅ 체험단 봇이 정상 동작을 재개했습니다.' });
+    return result.ok;
   }
   async postThread(request, text) {
     if (!request.threadTs || !this.requests.matchesBinding(request, this.binding)) return;

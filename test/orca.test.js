@@ -48,6 +48,10 @@ test('Orca가 입력을 보내지 않은 클릭만 다시 시도하고, 두 번�
   await new OrcaTab('P1', { run, pollMs: 1 }).click('#x');
   assert.equal(clicks, 3);
   assert.deepEqual(calls.map(c => c[0] === 'tab' ? `tab ${c[1]}` : c[0]), ['click', 'click', 'tab switch', 'click']);
+  let blocked = 0;
+  const guard = fakeOrca({ click: () => { blocked++; throw notSent; }, 'tab switch': () => ({}) });
+  await assert.rejects(new OrcaTab('P1', { run: guard.run, pollMs: 1 }).click('#x'), /input was not sent/);
+  assert.equal(blocked, 6, '보내지 않은 클릭은 6번까지 시도한 뒤 오류로 넘긴다');
   let other = 0;
   const failing = fakeOrca({ click: () => { other++; throw new OrcaError('browser_stale_ref', 'stale'); } });
   await assert.rejects(new OrcaTab('P1', { run: failing.run, pollMs: 1 }).click('#x'), /stale/);
