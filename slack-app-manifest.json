@@ -1,0 +1,22 @@
+{
+  "display_information": {
+    "name": "Musinsa reviewer bot",
+    "description": "체험단 공고 알림과 스레드 답장 승인"
+  },
+  "features": {
+    "bot_user": { "display_name": "무신사 체험단 봇", "always_online": false }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["incoming-webhook", "chat:write", "channels:history", "groups:history"]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "interactivity": { "is_enabled": true },
+    "event_subscriptions": { "bot_events": ["message.channels", "message.groups"] },
+    "incoming_webhooks": { "incoming_webhooks_enabled": true },
+    "org_deploy_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

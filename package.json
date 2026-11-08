@@ -1,0 +1,27 @@
+{
+  "name": "musinsa-reviewer-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "무신사 체험단 공고 필터링 및 Orca 내장 브라우저 자동 신청 CLI",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "init": "node src/cli.js init",
+    "login": "node src/cli.js login",
+    "scan": "node src/cli.js scan",
+    "start": "node src/cli.js run",
+    "status": "node src/cli.js status",
+    "reviews": "node src/cli.js reviews",
+    "choose": "node src/cli.js choose",
+    "notify:test": "node src/cli.js notify-test",
+    "slack:start": "node src/cli.js run --slack-approval --submit --watch",
+    "approvals": "node src/cli.js approvals",
+    "test": "node --test --test-concurrency=1",
+    "test:orca": "ORCA_BROWSER_TEST=1 node --test --test-concurrency=1"
+  },
+  "dependencies": {
+    "@slack/bolt": "5.1.0"
+  }
+}

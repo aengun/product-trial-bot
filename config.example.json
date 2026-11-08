@@ -1,0 +1,79 @@
+{
+  "gender": "M",
+  "categories": [
+    "전체"
+  ],
+  "profile": {
+    "heightCm": 170,
+    "weightKg": 65,
+    "topSizes": [
+      "M",
+      "L"
+    ],
+    "bottomSizes": [
+      "29",
+      "30"
+    ],
+    "shoeSize": "260",
+    "topFit": {
+      "chestMin": 50,
+      "chestMax": 62,
+      "lengthMin": 63,
+      "lengthMax": 72,
+      "targetChest": 55,
+      "targetLength": 68
+    }
+  },
+  "includeKeywords": [],
+  "excludeKeywords": [
+    "여성",
+    "여자",
+    "우먼",
+    "women",
+    "woman",
+    "female",
+    "레이디스",
+    "ladies",
+    "키즈",
+    "주니어",
+    "어린이",
+    "아동",
+    "유소년",
+    "kids",
+    "junior",
+    "children",
+    "toddler",
+    "영유아",
+    "유아용"
+  ],
+  "brands": [],
+  "campaignIds": [],
+  "preferredOptions": [],
+  "campaignOptions": {},
+  "acceptedConsentIds": [],
+  "maxApplicationsPerRun": 5,
+  "maxPages": 100,
+  "intervalSeconds": 7200,
+  "actionDelayMs": 1500,
+  "timeoutMs": 15000,
+  "sizeReview": {
+    "scoreGap": 2,
+    "boundaryCm": 1
+  },
+  "notifications": {
+    "desktop": true,
+    "terminal": true,
+    "slack": false
+  },
+  "selectors": {},
+  "schedule": {
+    "timeZone": "Asia/Seoul",
+    "startHour": 8,
+    "endHour": 22,
+    "intervalHours": 2
+  },
+  "excludeCategories": [
+    "키즈"
+  ],
+  "excludeFemaleCosmetics": true
+}
