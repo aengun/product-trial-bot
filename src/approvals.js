@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { normalize } from './filters.js';
+import { sizeText } from './sizing.js';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function planProof(plan) {
@@ -25,6 +26,21 @@ export function approvalChoices(plan) {
     .map((p, index) => ({ productUniqueId: p.productUniqueId, optionNo: p.optionNo, selectedSize: p.selectedSize,
       choiceKey: p.choiceKey ?? `옵션${index + 1}`,
       productName: p.productName, steps: p.steps, ...(p.selectionKind ? { selectionKind: p.selectionKind } : {}) }));
+}
+
+/**
+ * 봇이 프로필·실측으로 고른 추천 사이즈에 해당하는 선택지입니다. 슬랙 버튼 색 표시에만 쓰고
+ * 알림 지문(fingerprint)에는 넣지 않아, 추천 표시가 바뀌어도 이미 보낸 알림을 다시 보내지 않습니다.
+ */
+export function recommendationFor(plan, choices) {
+  const hint = plan.review?.recommendation ?? plan.recommendation
+    ?? (plan.status === 'planned' && validChoice(plan) ? { productUniqueId: plan.productUniqueId, sizes: [plan.selectedSize] } : null);
+  const wanted = (Array.isArray(hint?.sizes) ? hint.sizes : []).filter(size => typeof size === 'string' && sizeText(size));
+  if (!wanted.length || choices.length < 2) return { proofs: [], sizes: [] };
+  const matches = (choice, size) => sizeText(choice.selectedSize) === sizeText(size) || choice.steps.some(step => sizeText(step) === sizeText(size));
+  const picked = choices.filter(choice => (!hint.productUniqueId || choice.productUniqueId === String(hint.productUniqueId))
+    && wanted.some(size => matches(choice, size)));
+  return { proofs: picked.map(planProof), sizes: [...new Set(wanted.filter(size => picked.some(choice => matches(choice, size))))] };
 }
 
 const combinationText = text => normalize(text).replace(/\s*[/*×,]\s*/g, ' ').replace(/\s+/g, ' ').trim();
@@ -92,6 +108,7 @@ export class ApprovalStore {
   async ensure(campaign, plan, binding) {
     const choices = approvalChoices(plan);
     const proof = fingerprint(campaign, choices, plan.review?.measurements ?? []);
+    const recommendation = recommendationFor(plan, choices);
     // 거절한 공고는 승인 요청 만료 후에도 다시 알리지 않습니다.
     const matching = (await this.list()).filter(r => r.campaign.id === campaign.id && this.matchesBinding(r, binding)
       && (r.status === 'rejected' || (r.fingerprint === proof
@@ -103,7 +120,8 @@ export class ApprovalStore {
     const expiresAt = Number.isFinite(deadline) ? deadline : createdAt + 24 * 60 * 60 * 1000;
     const request = { version: 1, id: randomUUID(), fingerprint: proof, campaign: {
       id: campaign.id, title: campaign.title, url: campaign.url, endDate: campaign.endDate, category: plan.category ?? campaign.category,
-    }, choices, selectedChoice: null, replyMode: 'option-submit', uiRevision: randomUUID(),
+    }, choices, recommended: recommendation.proofs, recommendedSizes: recommendation.sizes,
+    selectedChoice: null, replyMode: 'option-submit', uiRevision: randomUUID(),
     reason: plan.reason ?? '', measurements: plan.review?.measurements ?? [],
     ...(plan.selectionKind ? { selectionKind: plan.selectionKind } : {}), binding,
     createdAt, expiresAt, status: 'posting', processedEvents: [] };
@@ -141,6 +159,8 @@ export class ApprovalStore {
       const selected = r.status === 'approved' && r.selectedChoice
         ? choices.find(choice => planProof(choice) === planProof(r.selectedChoice)) : null;
       r.choices = choices; r.selectedChoice = selected ?? null;
+      const recommendation = recommendationFor(plan, choices);
+      r.recommended = recommendation.proofs; r.recommendedSizes = recommendation.sizes;
       r.status = selected ? 'approved' : 'pending';
       if (!selected) { delete r.approvedAt; delete r.approvedBy; }
       r.fingerprint = fingerprint(campaign, choices, measurements);

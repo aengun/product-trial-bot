@@ -259,3 +259,13 @@ test('실측 API 응답을 실측표 형태로 바꾸고 0(미측정)과 낯선 
   assert.equal(sizeTableFromApi({ sizes: [{ name: 'M', items: 'x' }] }), null);
   assert.equal(sizeTableFromApi(null), null);
 });
+
+test('상의 실측이 비슷하거나 경계에 가까워 직접 확인할 때도 후보 사이즈를 추천으로 넘긴다', () => {
+  const close = { ...table, rows: [{ size: 'M', values: [67, 55] }, { size: 'L', values: [68, 56] }] };
+  const review = planOptions(event, product, config, close);
+  assert.equal(review.status, 'needs-size-review');
+  assert.deepEqual(review.review.recommendation, { productUniqueId: '100', sizes: ['M', 'L'] });
+  const edge = { ...table, rows: [{ size: 'M', values: [68, 50.5] }, { size: 'L', values: [70, 63] }] };
+  assert.deepEqual(planOptions(event, product, config, edge).review.recommendation, { productUniqueId: '100', sizes: ['M'] });
+  assert.equal(planOptions(event, product, config, null).review.recommendation, undefined, '실측이 없으면 추천하지 않는다');
+});

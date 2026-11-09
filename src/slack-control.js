@@ -1,8 +1,8 @@
 import bolt from '@slack/bolt';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ApprovalStore, planProof, validChoice, buttonValue, rejectValue, REJECT_ACTION, choiceLabel } from './approvals.js';
-import { campaignLink } from './slack.js';
 import { CATEGORY_NAMES, normalize } from './filters.js';
+import { PLATFORMS } from './platforms.js';
 
 /** 상품명을 뺀 옵션 단계가 API의 NONE(화면 표시 FREE)뿐이면 옵션이 없는 상품입니다. */
 const withoutOption = choice => choice.steps.filter(step => step !== choice.productName)
@@ -18,7 +18,7 @@ export function slackControlSettings(env = process.env) {
     userId: env.SLACK_APPROVER_USER_ID, channelId: env.SLACK_CHANNEL_ID };
 }
 
-export function approvalPayload(request) {
+export function approvalPayload(request, platform = PLATFORMS.musinsa) {
   const title = request.campaign.title.replace(/\s*체험단\s*\d+명\s*모집\s*$/, '').trim();
   const active = ['posting', 'pending'].includes(request.status);
   const single = request.choices.length === 1 ? request.choices[0] : null;
@@ -26,11 +26,21 @@ export function approvalPayload(request) {
     processing: '신청 중', expired: '모집 마감', stale: '옵션 갱신 필요', rejected: request.rejectedBy ? '거절함' : '건너뛴 공고',
     excluded: `제외 · ${request.excludedReason ?? '필터 설정'}` }[request.status] ?? '확인 필요';
   const categoryName = CATEGORY_NAMES[request.campaign.category] ?? request.campaign.category;
-  const category = categoryName !== '전체' && Object.values(CATEGORY_NAMES).includes(categoryName) ? ` · ${categoryName}` : '';
+  const musinsa = platform.id === 'musinsa';
+  // 추천 사이즈 선택지는 초록(primary) 버튼과 ★로 표시합니다. 거절은 빨강(danger), 나머지는 기본색입니다.
+  const recommended = new Set(Array.isArray(request.recommended) ? request.recommended : []);
+  const recommendedSizes = Array.isArray(request.recommendedSizes) ? request.recommendedSizes.filter(size => typeof size === 'string' && size.trim()) : [];
+  const starred = !single && request.choices.some(choice => recommended.has(planProof(choice)));
+  const category = musinsa
+    ? (categoryName !== '전체' && Object.values(CATEGORY_NAMES).includes(categoryName) ? ` · ${categoryName}` : '')
+    : (typeof categoryName === 'string' && categoryName.trim() ? ` · ${categoryName.trim().slice(0, 40)}` : '');
+  // 29CM 공고 키처럼 긴 번호는 머리글에 넣지 않습니다.
+  const heading = musinsa ? `체험단 #${request.campaign.id}` : `${platform.name} 체험단`;
   const blocks = [
-    { type: 'header', text: { type: 'plain_text', text: `━━ 체험단 #${request.campaign.id}${category} ━━`.slice(0, 150) } },
+    { type: 'header', text: { type: 'plain_text', text: `━━ ${heading}${category} ━━`.slice(0, 150) } },
     { type: 'section', text: { type: 'plain_text', text: active
-      ? `${title}\n${single ? `${withoutOption(single) ? '옵션 없음' : choiceLabel(single)} · 승인하면 신청` : `옵션 ${request.choices.length}개 · 누르면 신청`}`
+      ? `${title}\n${single ? `${withoutOption(single) ? '옵션 없음' : choiceLabel(single)} · 승인하면 신청` : `옵션 ${request.choices.length}개 · 누르면 신청`}${
+        starred ? ` · ★ 추천${recommendedSizes.length ? ` ${recommendedSizes.join(', ').slice(0, 60)}` : ''}` : ''}`
       : `${title}\n${statusText}${request.selectedChoice && request.status !== 'excluded' ? `: ${choiceLabel(request.selectedChoice)}` : ''}` } },
   ];
   const rejectButton = { type: 'button', action_id: REJECT_ACTION, style: 'danger',
@@ -56,19 +66,20 @@ export function approvalPayload(request) {
         elements: group.slice(offset, offset + rowSize).map(({ choice, index }) => {
           const steps = groups.size > 1 && choice.steps[0] === choice.productName ? choice.steps.slice(1) : choice.steps;
           const label = choiceLabel({ steps });
-          return { type: 'button', action_id: `musinsa_choose_${index + 1}`,
-            text: { type: 'plain_text', text: `${index + 1}. ${label}`.slice(0, 75) },
-            accessibility_label: `${choice.choiceKey ?? `옵션${index + 1}`} ${label}`.slice(0, 75), value: buttonValue(request, choice) };
+          const star = recommended.has(planProof(choice));
+          return { type: 'button', action_id: `musinsa_choose_${index + 1}`, ...(star ? { style: 'primary' } : {}),
+            text: { type: 'plain_text', text: `${star ? '★ ' : ''}${index + 1}. ${label}`.slice(0, 75) },
+            accessibility_label: `${star ? '추천 ' : ''}${choice.choiceKey ?? `옵션${index + 1}`} ${label}`.slice(0, 75), value: buttonValue(request, choice) };
         }) });
     }
   }
   if (active && !single) blocks.push({ type: 'actions', block_id: `${request.id}:${request.uiRevision}:reject`, elements: [rejectButton] });
-  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `<${campaignLink(request.campaign.url)}|공고 보기>`, verbatim: true } },
+  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `<${platform.link(request.campaign.url)}|공고 보기>`, verbatim: true } },
     { type: 'divider' });
   if (blocks.length > 50) throw new Error('조합 버튼이 Slack 메시지의 블록 수 한도를 초과했습니다.');
   return {
     channel: request.binding.channelId,
-    text: `체험단 #${request.campaign.id} · ${title}`.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+    text: `${musinsa ? `체험단 #${request.campaign.id}` : `${platform.name} 체험단`} · ${title}`.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
     mrkdwn: false, parse: 'none', unfurl_links: false, unfurl_media: false,
     blocks,
   };
@@ -78,8 +89,8 @@ const silentLogger = { debug() {}, info() {}, warn() {}, error() {}, setLevel() 
 
 export class SlackApprovalController {
   constructor(directory, { env = process.env, now = Date.now, wait = delay, appFactory = options => new bolt.App(options),
-    log = message => console.log(message) } = {}) {
-    this.settings = slackControlSettings(env); this.now = now; this.log = log;
+    log = message => console.log(message), platform = PLATFORMS.musinsa } = {}) {
+    this.settings = slackControlSettings(env); this.now = now; this.log = log; this.platform = platform;
     this.waitInterval = wait; this.messageQueue = Promise.resolve();
     this.requests = new ApprovalStore(directory, { now });
     this.app = appFactory({ token: this.settings.botToken, appToken: this.settings.appToken, socketMode: true,
@@ -207,7 +218,7 @@ export class SlackApprovalController {
       }
       this.postedThisCycle++;
       try {
-        const result = await this.postMessage(approvalPayload(request));
+        const result = await this.postMessage(approvalPayload(request, this.platform));
         if (!result.ok) throw Object.assign(new Error(), { definiteFailure: true });
         if (result.channel !== this.binding.channelId || !/^\d+\.\d+$/.test(result.ts ?? '')) throw new Error();
         await this.requests.posted(request.id, result.channel, result.ts);
@@ -231,21 +242,36 @@ export class SlackApprovalController {
     });
     if (result.request) await this.postThread(result.request, `신청을 진행하지 못했습니다. ${reason}`);
   }
-  async complete(id, status) {
+  async complete(id, status, note) {
     const { request } = await this.requests.finish(id, status);
     try {
       await this.postThread(request, status === 'submitted'
-        ? `${choiceLabel(request.selectedChoice)} 신청 완료를 확인했습니다.`
-        : '제출 결과를 확인하지 못했습니다. 중복 신청을 막기 위해 재시도하지 않습니다. 무신사 신청 내역을 확인해 주세요.');
+        ? `${choiceLabel(request.selectedChoice)} 신청 완료를 확인했습니다.${note ? `\n${note}` : ''}`
+        : `제출 결과를 확인하지 못했습니다. 중복 신청을 막기 위해 재시도하지 않습니다. ${this.platform.name} 신청 내역을 확인해 주세요.`);
     } catch { return false; }
     await this.updateRequestMessage(id).catch(() => {});
+    return true;
+  }
+  /**
+   * 사이트가 신청을 받지 않았다고 확인된 승인 건입니다. 로그인·배송지처럼 사용자가 고칠 수 있는 문제(retry)는
+   * 승인 상태로 되돌려 해결 후 다시 신청하고, 그 밖의 거절은 다음 정기 알림에서 새로 확인하도록 닫습니다.
+   */
+  async notSent(id, reason, { retry = false } = {}) {
+    const { request } = await this.requests.mutate(id, r => {
+      if (r.status !== 'processing') return { save: false };
+      r.status = retry ? 'approved' : 'stale'; delete r.processingAt;
+      return { request: r };
+    });
+    if (!request) return false;
+    await this.problem(id, reason);
+    if (!retry) await this.updateRequestMessage(id).catch(() => {});
     return true;
   }
   async updateRequestMessage(id) {
     const work = this.messageQueue.then(async () => {
       const request = (await this.requests.list()).find(request => request.id === id);
       if (!request?.threadTs || !this.requests.matchesBinding(request, this.binding)) return;
-      const payload = approvalPayload(request);
+      const payload = approvalPayload(request, this.platform);
       if (this.nextPostAt > this.now()) await this.waitInterval(this.nextPostAt - this.now());
       this.nextPostAt = this.now() + 1250;
       const result = await this.app.client.chat.update({ channel: payload.channel, ts: request.threadTs,
@@ -266,7 +292,7 @@ export class SlackApprovalController {
     this.alerts.set(message, this.now()); this.alertOpen = true;
     const result = await this.postMessage({ channel: this.binding.channelId, mrkdwn: false, parse: 'none',
       unfurl_links: false, unfurl_media: false,
-      text: `⚠️ 체험단 봇 오류\n${message}`.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') });
+      text: `⚠️ ${this.platform.id === 'musinsa' ? '' : `${this.platform.name} `}체험단 봇 오류\n${message}`.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') });
     if (!result.ok) throw new Error('슬랙 오류 알림 실패');
     return true;
   }
@@ -275,7 +301,7 @@ export class SlackApprovalController {
     if (!this.alertOpen || !this.binding) return false;
     this.alertOpen = false; this.alerts?.clear();
     const result = await this.postMessage({ channel: this.binding.channelId, mrkdwn: false, parse: 'none',
-      text: '✅ 체험단 봇이 정상 동작을 재개했습니다.' });
+      text: `✅ ${this.platform.id === 'musinsa' ? '' : `${this.platform.name} `}체험단 봇이 정상 동작을 재개했습니다.` });
     return result.ok;
   }
   async postThread(request, text) {

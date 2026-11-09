@@ -1,6 +1,6 @@
 import { normalize, excludedCosmetic } from './filters.js';
 
-const sizeText = value => normalize(value).replace(/\s*mm$/, '');
+export const sizeText = value => normalize(String(value ?? '')).replace(/\s*mm$/, '');
 
 export function rankTopSizes(table, profile, availableSizes) {
   if (!table || !Array.isArray(table.rows)) return [];
@@ -73,12 +73,13 @@ export function planOptions(event, product, config, table = null, decision = nul
   const availableSizes = [...new Set(stocked.map(selectionKey).filter(Boolean))];
   const title = normalize(event.name);
   const score = item => item.optionValues.reduce((sum, v) => sum + (title.includes(normalize(v.name)) ? 1 : 0), 0);
-  const review = (reason, measurements = []) => ({
+  // recommendedSizes: 실측상 후보인 사이즈. 슬랙 버튼에 추천 표시만 하고 자동 선택하지 않습니다.
+  const review = (reason, measurements = [], recommendedSizes = []) => ({
     status: 'needs-size-review', reason, ...(generic ? { selectionKind: 'option' } : {}),
     review: { productUniqueId: String(product.uniqueId), productName: product.name,
       productUrl: `https://www.musinsa.com/products/${product.uniqueId}`,
       availableSizes, measurements,
-      choices },
+      choices, ...(recommendedSizes.length ? { recommendation: { productUniqueId: String(product.uniqueId), sizes: recommendedSizes } } : {}) },
   });
   if (decision) {
     if (decision.productUniqueId !== String(product.uniqueId)) return review('상품 구성이 변경되어 이전 사이즈 선택을 적용하지 않았습니다.');
@@ -104,12 +105,13 @@ export function planOptions(event, product, config, table = null, decision = nul
       const distinct = ranked.filter((r, i) => ranked.findIndex(x => sizeText(x.size) === sizeText(r.size)) === i);
       const scoreGap = config.sizeReview?.scoreGap ?? 2;
       if (distinct.length > 1 && distinct[1].score - distinct[0].score <= scoreGap) {
-        return review(`${distinct[0].size}와 ${distinct[1].size}의 실측 적합도 차이가 작아 직접 확인이 필요합니다.`, measurements);
+        return review(`${distinct[0].size}와 ${distinct[1].size}의 실측 적합도 차이가 작아 직접 확인이 필요합니다.`, measurements,
+          [distinct[0].size, distinct[1].size]);
       }
       const fit = config.profile.topFit, boundary = config.sizeReview?.boundaryCm ?? 1;
       if (ranked[0].chest - fit.chestMin <= boundary || fit.chestMax - ranked[0].chest <= boundary
         || ranked[0].length - fit.lengthMin <= boundary || fit.lengthMax - ranked[0].length <= boundary) {
-        return review(`${ranked[0].size}의 실측이 허용 범위 경계에 가까워 직접 확인이 필요합니다.`, measurements);
+        return review(`${ranked[0].size}의 실측이 허용 범위 경계에 가까워 직접 확인이 필요합니다.`, measurements, [ranked[0].size]);
       }
       wanted = ranked[0].size;
       sizing = `${wanted}: 총장 ${ranked[0].length}cm, 가슴단면 ${ranked[0].chest}cm (설정 목표치와 비교)`;

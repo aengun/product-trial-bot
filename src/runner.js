@@ -82,28 +82,36 @@ export async function runCycle({ client, store, config, submit = false, signal, 
           await store.set(campaign.id, { ...campaign, ...plan, status: 'submitting' });
           attempted = true;
           const receipt = await client.submit(plan);
-          const result = { ...campaign, ...plan, ...receipt, status: 'submitted' };
+          const { note, ...saved } = receipt ?? {};
+          const result = { ...campaign, ...plan, ...saved, status: 'submitted' };
           await store.set(campaign.id, result);
           if (approvalGate) {
-            try { result.slackOutcomeSent = await approvalGate.complete(approval.requestId, 'submitted'); }
+            try { result.slackOutcomeSent = await approvalGate.complete(approval.requestId, 'submitted', note); }
             catch { result.slackOutcomeSent = false; }
           }
           report.results.push(result); log(result);
         }
       } catch (error) {
         if (signal?.aborted && !attempted) throw error;
-        const result = { ...campaign, ...(plan ?? {}), status: attempted ? 'uncertain' : (error.code ?? 'error'),
-          reason: attempted ? '제출 결과를 확인하지 못했습니다. 무신사 신청 내역을 확인한 후 resolve 명령을 사용하세요.'
+        // 사이트가 신청을 받지 않았다고 확인된 경우(notSubmitted)는 결과 불확실로 막지 않습니다.
+        const notSent = attempted && error instanceof BotError && error.notSubmitted === true;
+        const uncertain = attempted && !notSent;
+        const site = client.siteName ?? '무신사';
+        const result = { ...campaign, ...(plan ?? {}), status: uncertain ? 'uncertain' : (error.code ?? 'error'),
+          reason: uncertain ? `제출 결과를 확인하지 못했습니다. ${site} 신청 내역을 확인한 후 resolve 명령을 사용하세요.`
             : error instanceof BotError ? error.message : '브라우저 작업을 완료하지 못했습니다.' };
         await store.set(campaign.id, result);
         if (!attempted && approval?.approved && approvalGate?.problem) {
           try { await approvalGate.problem(approval.requestId, result.reason); } catch {}
         }
-        if (attempted && approvalGate) {
+        if (notSent && approvalGate?.notSent) {
+          try { await approvalGate.notSent(approval.requestId, result.reason, { retry: error.fatal }); } catch {}
+        }
+        if (uncertain && approvalGate) {
           try { await approvalGate.complete(approval.requestId, 'uncertain'); } catch {}
         }
         report.results.push(result); log(result);
-        if (attempted) throw new BotError('uncertain', result.reason, true);
+        if (uncertain) throw new BotError('uncertain', result.reason, true);
         if (!(error instanceof BotError) || error.fatal) throw error;
       }
       if (planned >= config.maxApplicationsPerRun && (!approvalGate || approvedOnly)) break;

@@ -89,3 +89,15 @@ test('onError가 없으면 기존처럼 오류로 종료한다', async () => {
   await assert.rejects(watchSchedule({ schedule, now: () => at('08:00'),
     runScheduled: async () => { throw new Error('boom'); }, wait: async () => {} }), /boom/);
 });
+
+test('--now로 시작하면 바로 한 번 확인하고 그다음은 정기 시각을 기다린다', async () => {
+  const daily = { timeZone: 'Asia/Seoul', startHour: 8, endHour: 8, intervalHours: 24 };
+  let clock = at('14:10');
+  const scans = [], waits = [], done = new Error('test complete');
+  await assert.rejects(watchSchedule({ schedule: daily, now: () => clock, runNow: true,
+    runScheduled: async () => { scans.push(clock); clock += 5 * 60 * 1000; },
+    wait: async ms => { waits.push(ms); if (waits.length === 1) throw done; },
+  }), error => error === done);
+  assert.deepEqual(scans, [at('14:10')]);
+  assert.deepEqual(waits, [at('08:00', '2026-11-09') - at('14:15')]);
+});

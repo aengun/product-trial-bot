@@ -3,6 +3,9 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalize } from './filters.js';
 
+/** 무신사·4910은 숫자, 29CM는 PE_로 시작하는 공고 키를 씁니다. 경로 문자는 허용하지 않습니다. */
+const CAMPAIGN_ID = /^(?:\d+|PE_[A-Za-z0-9]{8,64})$/;
+
 export const BLOCKING_STATUSES = new Set(['submitted', 'already-applied', 'submitting', 'uncertain']);
 
 export class StateStore {
@@ -19,7 +22,7 @@ export class StateStore {
         throw new Error('지원하지 않는 신청 기록 형식입니다.');
       }
       for (const [id, entry] of Object.entries(data.campaigns)) {
-        if (!/^\d+$/.test(id) || !entry || typeof entry.status !== 'string') throw new Error('신청 기록이 손상되었습니다.');
+        if (!CAMPAIGN_ID.test(id) || !entry || typeof entry.status !== 'string') throw new Error('신청 기록이 손상되었습니다.');
       }
       this.data = data;
     } catch (error) {
@@ -30,7 +33,7 @@ export class StateStore {
   get(id) { return this.data.campaigns[String(id)]; }
   blocks(id) { return BLOCKING_STATUSES.has(this.get(id)?.status); }
   async getSizeDecision(id) {
-    if (!/^\d+$/.test(String(id))) throw new Error('올바르지 않은 체험단 번호입니다.');
+    if (!CAMPAIGN_ID.test(String(id))) throw new Error('올바르지 않은 체험단 번호입니다.');
     try {
       const decision = JSON.parse(await readFile(join(this.directory, 'size-decisions', `${id}.json`), 'utf8'));
       if (decision.campaignId !== String(id) || typeof decision.size !== 'string' || !decision.size.trim()
@@ -53,7 +56,7 @@ export class StateStore {
     return decision;
   }
   async set(id, entry) {
-    if (!/^\d+$/.test(String(id))) throw new Error('올바르지 않은 체험단 번호입니다.');
+    if (!CAMPAIGN_ID.test(String(id))) throw new Error('올바르지 않은 체험단 번호입니다.');
     const next = {
       ...this.data,
       campaigns: { ...this.data.campaigns, [String(id)]: { ...entry, updatedAt: new Date().toISOString() } },

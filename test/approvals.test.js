@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ApprovalStore, planProof, buttonValue } from '../src/approvals.js';
+import { ApprovalStore, planProof, buttonValue, recommendationFor, approvalChoices } from '../src/approvals.js';
 import { SlackApprovalController, slackControlSettings, approvalPayload } from '../src/slack-control.js';
 import { StateStore } from '../src/store.js';
 import { runCycle } from '../src/runner.js';
@@ -515,4 +515,32 @@ test('봇 오류는 같은 내용을 6시간에 한 번만 채널에 알리고 �
   assert.equal(await controller.resolved(), false);
   assert.match(fixture.posts.at(-1).text, /정상 동작을 재개/);
   assert.equal(await controller.alert('로그인이 필요합니다. <!channel>'), true, '재개 후 같은 오류가 다시 나면 알린다');
+});
+
+test('추천 사이즈 버튼만 초록색 ★로 표시하고, 추천 표시만 달라진 공고는 다시 알리지 않는다', async t => {
+  const dir = await temporary(t), store = new ApprovalStore(dir);
+  const recommended = { ...review, review: { ...review.review, recommendation: { productUniqueId: '100', sizes: ['M'] } } };
+  const { request } = await store.ensure(campaign, recommended, binding);
+  assert.deepEqual(request.recommended, [planProof(choice())]);
+  assert.deepEqual(request.recommendedSizes, ['M']);
+  const payload = approvalPayload({ ...request, status: 'pending' });
+  const buttons = payload.blocks.flatMap(block => block.elements ?? []);
+  assert.deepEqual(buttons.map(b => [b.text.text, b.style]), [['★ 1. 검정 / M', 'primary'], ['2. 검정 / L', undefined], ['거절', 'danger']]);
+  assert.match(buttons[0].accessibility_label, /^추천 /);
+  assert.match(payload.blocks[1].text.text, /^검정 셔츠\n옵션 2개 · 누르면 신청 · ★ 추천 M$/);
+  await store.posted(request.id, 'CTEST', '1700000000.000001');
+  assert.equal((await store.ensure(campaign, review, binding)).created, false, '추천 표시는 알림 지문에 넣지 않는다');
+  // 추천 정보가 없는 예전 승인 기록은 기존과 같이 표시한다.
+  const legacy = approvalPayload({ ...request, status: 'pending', recommended: undefined, recommendedSizes: undefined });
+  assert.equal(legacy.blocks.flatMap(block => block.elements ?? []).filter(b => b.style === 'primary').length, 0);
+});
+
+test('봇이 고른 사이즈는 같은 상품의 같은 사이즈 색상 전부를 추천으로 표시하고 옵션 하나면 표시하지 않는다', () => {
+  const other = { ...choice('L', 3), productUniqueId: '200', steps: ['흰색', 'L'] };
+  const planned = { status: 'planned', ...choice('L', 2), choices: [choice('M', 1), choice('L', 2), { ...choice('L', 4), steps: ['흰색', 'L'] }, other] };
+  const result = recommendationFor(planned, approvalChoices(planned));
+  assert.deepEqual(result.proofs, [planProof(choice('L', 2)), planProof({ ...choice('L', 4), steps: ['흰색', 'L'] })]);
+  assert.deepEqual(result.sizes, ['L']);
+  assert.deepEqual(recommendationFor(plan, approvalChoices(plan)), { proofs: [], sizes: [] });
+  assert.deepEqual(recommendationFor(review, approvalChoices(review)), { proofs: [], sizes: [] }, '추천 근거가 없으면 표시하지 않는다');
 });

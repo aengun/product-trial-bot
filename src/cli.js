@@ -13,6 +13,9 @@ import { createSizeNotifier } from './notifications.js';
 import { SlackApprovalController } from './slack-control.js';
 import { ApprovalStore } from './approvals.js';
 import { watchSchedule } from './schedule.js';
+import { platformFor, platformEnv, platformConfig } from './platforms.js';
+import { TwentyNineClient } from './sites/29cm.js';
+import { FourNineTenClient } from './sites/4910.js';
 
 const help = `무신사 체험단 자동 신청 봇
 
@@ -34,7 +37,18 @@ const help = `무신사 체험단 자동 신청 봇
 
 공통 옵션: --config 경로 (기본 config.json), --data-dir 경로 (기본 .bot)
 특정 공고만: npm run slack:start -- --campaign-id 49540
+지금 바로 한 번 확인 후 정기 실행: npm run slack:start -- --now (29CM: npm run 29cm:start -- --now)
+
+29CM·4910 (전용 Slack 앱·채널, 상태 폴더 .bot/29cm·.bot/4910)
+  npm run 29cm:login / npm run 4910:login     Orca 탭에서 직접 로그인
+  npm run 29cm:scan  / npm run 4910:scan      모집 공고 수집
+  npm run 29cm:start / npm run 4910:start     슬랙 승인 후 신청 (반복 실행)
+  node src/cli.js status --platform 29cm      신청 기록 확인 (approvals·resolve도 같은 방식)
+  설정: .env.29cm / .env.4910 에 SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_CHANNEL_ID
 `;
+
+const SITE_COMMANDS = ['help', 'login', 'scan', 'run', 'status', 'resolve', 'approvals'];
+const LOGIN_PATHS = { '29cm': '/preuser', '4910': '/mypage' };
 
 function log(result) {
   console.log(`[${result.status}] ${result.id} ${result.title ?? ''}`);
@@ -48,18 +62,23 @@ async function main() {
   catch (error) { if (error.code !== 'ENOENT') throw new Error('로컬 .env 설정 파일을 읽을 수 없습니다.'); }
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
     config: { type: 'string', default: 'config.json' },
-    'data-dir': { type: 'string', default: '.bot' },
+    'data-dir': { type: 'string' }, platform: { type: 'string', default: 'musinsa' },
     submit: { type: 'boolean', default: false }, watch: { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h' }, applied: { type: 'boolean' }, retry: { type: 'boolean' },
     'slack-approval': { type: 'boolean', default: false }, 'campaign-id': { type: 'string' },
+    now: { type: 'boolean', default: false },
   } });
   const [command = 'help', id, size] = positionals;
   if (values.help || command === 'help') { console.log(help); return; }
+  const platform = platformFor(values.platform);
+  const musinsa = platform.id === 'musinsa';
+  if (!musinsa && !SITE_COMMANDS.includes(command)) throw new Error(`${command} 명령은 무신사 봇에서만 사용합니다.`);
   if (!['init', 'login', 'scan', 'run', 'status', 'resolve', 'consents', 'reviews', 'choose', 'notify-test', 'approvals'].includes(command)) throw new Error('알 수 없는 명령입니다. --help를 확인하세요.');
   if (values.submit && command !== 'run') throw new Error('--submit은 run 명령에서만 사용할 수 있습니다.');
   if (values.watch && command !== 'run') throw new Error('--watch는 run 명령에서만 사용할 수 있습니다.');
+  if (values.now && !values.watch) throw new Error('--now는 반복 실행(--watch, slack:start)에서만 사용할 수 있습니다.');
   if (values['slack-approval'] && (command !== 'run' || !values.submit || !values.watch)) throw new Error('슬랙 승인 모드는 npm run slack:start로 실행하세요.');
-  if (values['campaign-id'] && (command !== 'run' || !/^\d+$/.test(values['campaign-id']))) throw new Error('--campaign-id는 run 명령에서 체험단 번호로 지정하세요.');
+  if (values['campaign-id'] && (command !== 'run' || !platform.idPattern.test(values['campaign-id']))) throw new Error('--campaign-id는 run 명령에서 체험단 번호로 지정하세요.');
   if (positionals.length > (command === 'choose' ? 3 : command === 'resolve' ? 2 : 1)) throw new Error('예상하지 못한 인자입니다.');
   if (command !== 'resolve' && (values.applied || values.retry)) throw new Error('--applied/--retry는 resolve 명령에서만 사용할 수 있습니다.');
   if (command === 'consents') {
@@ -76,7 +95,7 @@ async function main() {
     console.log(`${configPath} 생성 완료. 172cm·65kg / 상의 M·L / 하의 29·30 / 신발 260 설정입니다.`);
     return;
   }
-  const directory = resolve(values['data-dir']);
+  const directory = resolve(values['data-dir'] ?? platform.dataDir);
   if (command === 'approvals') {
     const requests = await new ApprovalStore(directory).list();
     if (!requests.length) console.log('슬랙 승인 요청이 없습니다.');
@@ -128,25 +147,26 @@ async function main() {
       records.forEach(log); return;
     }
     if (command === 'resolve') {
-      if (!/^\d+$/.test(id ?? '') || Boolean(values.applied) === Boolean(values.retry)) throw new Error('resolve ID --applied 또는 resolve ID --retry를 사용하세요.');
+      if (!platform.idPattern.test(id ?? '') || Boolean(values.applied) === Boolean(values.retry)) throw new Error('resolve ID --applied 또는 resolve ID --retry를 사용하세요.');
       const entry = store.get(id);
       const approvalStore = new ApprovalStore(directory);
       const pendingApprovals = (await approvalStore.list()).filter(r => r.campaign.id === id && ['processing', 'uncertain'].includes(r.status));
       if (!entry || (!['uncertain', 'submitting'].includes(entry.status) && !pendingApprovals.length)) throw new Error('결과 미확정 상태인 체험단만 처리할 수 있습니다.');
       await store.set(id, { ...entry, status: values.applied ? 'submitted' : 'retry-allowed',
-        reason: '사용자가 무신사 신청 내역을 확인한 후 기록 처리', resolvedAt: new Date().toISOString() });
+        reason: `사용자가 ${platform.name} 신청 내역을 확인한 후 기록 처리`, resolvedAt: new Date().toISOString() });
       for (const request of pendingApprovals) await approvalStore.mark(request.id, values.applied ? 'submitted' : 'stale');
       console.log(`${id}: ${values.applied ? '신청 완료로 확정' : '재시도 허용'}`); return;
     }
-    const config = await loadConfig(configPath);
+    const config = platformConfig(platform, await loadConfig(configPath));
     if (values['slack-approval']) {
-      approvalController = new SlackApprovalController(directory);
+      approvalController = new SlackApprovalController(directory, { env: platformEnv(platform), platform });
       await approvalController.start();
       console.log('슬랙 옵션 선택을 수신합니다. 조합 버튼을 누르거나 옵션 번호만 답장하면 신청합니다.');
     }
     // Orca 내장 브라우저의 봇 전용 탭을 사용합니다. 로그인은 Orca 브라우저에 남습니다.
-    const tab = await openBotTab(directory, `${ORIGIN}/preuser/main`, { signal: abort.signal });
-    const client = new MusinsaClient(tab, config);
+    const tab = await openBotTab(directory, musinsa ? `${ORIGIN}/preuser/main` : platform.startUrl, { signal: abort.signal });
+    const client = musinsa ? new MusinsaClient(tab, config)
+      : platform.id === '29cm' ? new TwentyNineClient(tab, config) : new FourNineTenClient(tab, config);
     await client.start();
     if (values['campaign-id']) {
       const targetId = values['campaign-id'];
@@ -155,6 +175,20 @@ async function main() {
         const result = await scan(signal);
         return { ...result, campaigns: result.campaigns.filter(campaign => campaign.id === targetId) };
       };
+    }
+    if (command === 'login' && !musinsa) {
+      await tab.show().catch(() => {});
+      if (await client.isLoggedIn()) { console.log(`이미 ${platform.name}에 로그인되어 있습니다. Orca 브라우저의 로그인을 그대로 사용합니다.`); return; }
+      await client.goto(LOGIN_PATHS[platform.id]);
+      console.log(`Orca ${platform.name} 탭에서 '로그인/회원가입' 버튼을 눌러 직접 로그인하세요.`);
+      console.log(platform.id === '29cm' ? '29CM 기본 배송지와 체험단 필수 동의 설정(acceptedConsentIds)도 확인하세요.' : '4910은 한 모집에서 5개 이상 신청해야 당첨 대상입니다.');
+      console.log('비밀번호는 코드·설정에 저장하지 않습니다. 로그인 세션은 Orca 브라우저에 보관합니다.');
+      const rl = createInterface({ input: stdin, output: stdout });
+      try { await rl.question('로그인을 마쳤으면 Enter: ', { signal: abort.signal }); }
+      finally { rl.close(); }
+      await client.start();
+      if (!await client.isLoggedIn()) throw new BotError('login-required', `${platform.name} 로그인 완료를 확인하지 못했습니다. 다시 로그인하세요.`, true);
+      console.log('로그인 확인 완료. 다음 실행에서도 같은 Orca 탭과 로그인을 사용합니다.'); return;
     }
     if (command === 'login') {
       await tab.show().catch(() => {});
@@ -175,7 +209,7 @@ async function main() {
       const result = await client.scan(abort.signal);
       await writeFile(resolve(directory, 'campaigns.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
       result.campaigns.forEach(c => console.log(`${c.id} [${c.category}] ${c.title}\n  ${c.url}`));
-      console.log(`${result.campaigns.length}개 공고 저장${result.complete ? '' : ' (maxPages 제한으로 일부만 수집)'}: .bot/campaigns.json`);
+      console.log(`${result.campaigns.length}개 공고 저장${result.complete ? '' : ' (maxPages 제한으로 일부만 수집)'}: ${resolve(directory, 'campaigns.json')}`);
       return;
     }
     console.log(approvalController ? '슬랙에서 승인한 공고만 신청합니다.' : values.submit ? '실제 신청 모드입니다.' : '미리보기 모드입니다. 실제 신청은 하지 않습니다.');
@@ -194,7 +228,7 @@ async function main() {
       let text = error instanceof BotError ? error.message : `작업 중 오류가 발생했습니다: ${error.message}`;
       if (error instanceof OrcaError && error.code === 'browser_tab_not_found') {
         try {
-          client.tab = await openBotTab(directory, `${ORIGIN}/preuser/main`, { signal: abort.signal });
+          client.tab = await openBotTab(directory, musinsa ? `${ORIGIN}/preuser/main` : platform.startUrl, { signal: abort.signal });
           text = '봇이 쓰던 Orca 탭이 닫혀 새 탭을 열었습니다.';
         } catch { text = '봇이 쓰던 Orca 탭이 닫혔고 새 탭도 열지 못했습니다. Orca 앱을 확인하세요.'; }
       } else if (error instanceof OrcaError && error.code === 'browser_host_unavailable') {
@@ -207,8 +241,8 @@ async function main() {
     if (values.watch && config.schedule) {
       const hours = [];
       for (let hour = config.schedule.startHour; hour <= config.schedule.endHour; hour += config.schedule.intervalHours) hours.push(`${String(hour).padStart(2, '0')}:00`);
-      console.log(`매일 ${hours.join(', ')}에 공고를 확인합니다 (한국 시간).`);
-      await watchSchedule({ schedule: config.schedule, signal: abort.signal, log: console.log,
+      console.log(`${musinsa ? '' : `[${platform.name}] `}${values.now ? '지금 바로 한 번 확인하고, 이후 ' : ''}매일 ${hours.join(', ')}에 공고를 확인합니다 (한국 시간).`);
+      await watchSchedule({ schedule: config.schedule, signal: abort.signal, log: console.log, runNow: values.now,
         runScheduled: () => executeCycle(),
         runApproved: async () => {
           if (!approvalController || !(await approvalController.approvedCampaignIds()).some(id => !store.blocks(id))) return false;

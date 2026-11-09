@@ -21,8 +21,9 @@ export const formatScheduledTime = timestamp => new Intl.DateTimeFormat('ko-KR',
  * 다시 시도하고(다음 정기 시각을 넘기지 않음), 승인 건 처리가 실패하면 다음 승인·정기 시각까지 기다립니다.
  */
 export async function watchSchedule({ schedule, runScheduled, runApproved = async () => false,
-  wait, signal, now = Date.now, log = () => {}, onError, retryMs = 10 * 60 * 1000, maxRetries = 3 }) {
-  let nextAt = nextScheduledRun(schedule, now()), retries = 0;
+  wait, signal, now = Date.now, log = () => {}, onError, retryMs = 10 * 60 * 1000, maxRetries = 3, runNow = false }) {
+  // runNow: 시작하자마자 정기 확인을 한 번 하고 이후 정기 시각을 따릅니다(--now). 기본은 다음 정기 시각까지 기다립니다.
+  let nextAt = runNow ? now() : nextScheduledRun(schedule, now()), retries = 0;
   const attempt = async run => {
     try { return { ok: true, value: await run() }; }
     catch (error) {

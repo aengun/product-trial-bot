@@ -96,7 +96,9 @@ test('봇은 Orca 내장 브라우저만 쓰고 Playwright·Chrome을 띄우지 
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(!('playwright' in (pkg.dependencies ?? {})) && !('playwright' in (pkg.devDependencies ?? {})));
   const dir = new URL('../src/', import.meta.url);
-  for (const file of await readdir(dir)) {
+  const files = (await readdir(dir, { recursive: true })).filter(file => file.endsWith('.js'));
+  assert.ok(files.some(file => file.startsWith('sites')), '플랫폼별 사이트 코드도 검사한다');
+  for (const file of files) {
     const source = await readFile(new URL(file, dir), 'utf8');
     assert.doesNotMatch(source, /from ['"]playwright|puppeteer|launchPersistentContext|remote-debugging|channel:\s*['"]chrome/, file);
   }
